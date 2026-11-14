@@ -1,0 +1,57 @@
+name: mirror
+
+# Copies pinned fleet images from ghcr.io/thewoolleyman to ghcr.io/livespec-ai BY DIGEST.
+# Only GITHUB_TOKEN is used: an App installation token cannot create an org package
+# (GHCR 403 "installation not allowed to Create organization package", 2026-11-14).
+
+on:
+  workflow_dispatch:
+    inputs:
+      images:
+        description: >-
+          Newline-separated "name tag sha256:digest" triples, e.g.
+          "livespec-fabro-sandbox python-v1.210.0 sha256:...". Each source is ghcr.io/thewoolleyman/<name>@<digest>.
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install crane v0.20.2 (checksum-verified)
+        run: |
+          set -euo pipefail
+          url=https://github.com/google/go-containerregistry/releases/download/v0.20.2/go-containerregistry_Linux_x86_64.tar.gz
+          curl -fsSL -o crane.tgz "$url"
+          echo "c14340087103ba9dadf61d45acd20675490fd0ccbd56ac7901fc1b502137f44b  crane.tgz" | sha256sum -c -
+          tar -xzf crane.tgz crane
+          sudo install -m 0755 crane /usr/local/bin/crane
+          crane version
+
+      - name: Log in to ghcr.io with GITHUB_TOKEN
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+        run: printf '%s' "$TOKEN" | crane auth login ghcr.io -u "$ACTOR" --password-stdin
+
+      - name: Copy each image by digest and verify both sides
+        env:
+          IMAGES: ${{ inputs.images }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$IMAGES" | while read -r name tag digest; do
+            [ -n "${name:-}" ] || continue
+            case "$digest" in sha256:*) ;; *) echo "::error::bad digest for $name $tag: $digest"; exit 1;; esac
+            src="ghcr.io/thewoolleyman/${name}@${digest}"
+            dst="ghcr.io/livespec-ai/${name}:${tag}"
+            crane copy "$src" "$dst"
+            got_src=$(crane digest "ghcr.io/thewoolleyman/${name}:${tag}")
+            got_dst=$(crane digest "$dst")
+            echo "$name $tag source=$got_src dest=$got_dst pinned=$digest"
+            if [ "$got_dst" != "$digest" ]; then echo "::error::$dst digest $got_dst != pinned $digest"; exit 1; fi
+            if [ "$got_src" != "$digest" ]; then echo "::warning::source tag $tag now points at $got_src, not the pinned $digest"; fi
+          done
