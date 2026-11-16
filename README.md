@@ -10,3 +10,5 @@ Run `mirror` (workflow_dispatch) with one `name tag sha256:digest` triple per li
 organization package: GHCR answers 403 "installation not allowed to Create organization package".
 
 Re-run it at the cutover halt with the then-current pinned tags.
+
+Pull requests land on main through the livespec-ai merge queue (ruleset master-incident-recovery-bypass); ci-green is the required check.
