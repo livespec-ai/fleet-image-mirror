@@ -12,3 +12,5 @@ organization package: GHCR answers 403 "installation not allowed to Create organ
 Re-run it at the cutover halt with the then-current pinned tags.
 
 Pull requests land on main through the livespec-ai merge queue (ruleset master-incident-recovery-bypass); ci-green is the required check.
+
+The merge-group-guard job skips a merge group whose tree equals the pull request head tree.
