@@ -13,7 +13,111 @@ permissions:
   contents: read
 
 jobs:
+  # Tree-equality skip, the fleet's merge-group-guard shape (plan
+  # stale-base-merge-options, epic livespec-dev-tooling-xowhol DoD 12; decision
+  # contract: livespec-dev-tooling livespec_dev_tooling/merge_group_skip.py).
+  # skip=true ONLY for a one-entry group on an unmoved base whose head tree equals
+  # its pull request head's tree and whose head's required checks (the names in
+  # REQUIRED below: keep in lockstep with the jobs ci-green needs, plus ci-green)
+  # all concluded success on that head. Any doubt or error is skip=false. Kill
+  # switch: repository variable LIVESPEC_MERGE_GROUP_SKIP_DISABLED=true.
+  merge-group-guard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      checks: read
+      contents: read
+      pull-requests: read
+    outputs:
+      skip: ${{ steps.skip.outputs.skip || 'false' }}
+    steps:
+      - name: Decide the tree-equality skip from the forge (merge_group only)
+        id: skip
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MG_HEAD_SHA: ${{ github.event.merge_group.head_sha }}
+          MG_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          MG_BASE_REF: ${{ github.event.merge_group.base_ref }}
+          LIVESPEC_MERGE_GROUP_SKIP_DISABLED: ${{ vars.LIVESPEC_MERGE_GROUP_SKIP_DISABLED }}
+        run: |
+          skip=false
+          if [ "$GITHUB_EVENT_NAME" = "merge_group" ]; then
+            out="$(python3 - <<'PY' || true
+          import json, os, subprocess
+
+          REQUIRED = ["actionlint", "ci-green"]
+          repo = os.environ["GITHUB_REPOSITORY"]
+          owner, name = repo.split("/", 1)
+          head = os.environ["MG_HEAD_SHA"]
+          base = os.environ["MG_BASE_SHA"]
+          branch = os.environ["MG_BASE_REF"].removeprefix("refs/heads/")
+
+          def gh(*a):
+              return subprocess.run(["gh", *a], check=True, capture_output=True, text=True).stdout
+
+          def decide():
+              if os.environ.get("LIVESPEC_MERGE_GROUP_SKIP_DISABLED", "").strip().lower() == "true":
+                  return False, "LIVESPEC_MERGE_GROUP_SKIP_DISABLED is true"
+              q = ("query($owner: String!, $name: String!, $branch: String!) {"
+                   " repository(owner: $owner, name: $name) { mergeQueue(branch: $branch) {"
+                   " entries(first: 100) { nodes { position headCommit { oid } baseCommit { oid }"
+                   " pullRequest { number headRefOid baseRefName } } } } } }")
+              data = json.loads(gh("api", "graphql", "-f", f"query={q}", "-f", f"owner={owner}",
+                                   "-f", f"name={name}", "-f", f"branch={branch}"))
+              nodes = sorted(data["data"]["repository"]["mergeQueue"]["entries"]["nodes"],
+                             key=lambda e: int(e["position"]))
+              cut = [i for i, e in enumerate(nodes) if (e["headCommit"] or {}).get("oid") == head]
+              if cut != [0]:
+                  return False, "the group is not exactly the first queue entry"
+              entry = nodes[0]
+              if entry["baseCommit"]["oid"] != base:
+                  return False, "the entry's base commit is not the group's base commit"
+              pr = entry["pullRequest"]
+              if pr["baseRefName"] != branch:
+                  return False, "the pull request does not target the group's base branch"
+              pr_head, number = str(pr["headRefOid"]), int(pr["number"])
+              status = json.loads(gh("api", f"repos/{repo}/compare/{base}...{pr_head}"))["status"]
+              if status not in ("identical", "ahead"):
+                  return False, f"the group's base is not an ancestor of the head (compare: {status})"
+              def tree(sha):
+                  return json.loads(gh("api", f"repos/{repo}/git/commits/{sha}"))["tree"]["sha"]
+              if tree(head) != tree(pr_head):
+                  return False, "the group's tree differs from the pull request head's tree"
+              pages = json.loads(gh("api", "--paginate", "--slurp",
+                                    f"repos/{repo}/commits/{pr_head}/check-runs?per_page=100"))
+              latest = {}
+              for run in (r for pg in pages for r in pg["check_runs"]):
+                  bound = [(p["number"], p["base"]["ref"]) for p in run["pull_requests"]]
+                  if run["app"]["slug"] != "github-actions" or (number, branch) not in bound:
+                      continue
+                  n = str(run["name"])
+                  if n not in latest or int(run["id"]) > int(latest[n]["id"]):
+                      latest[n] = run
+              bad = [n for n in REQUIRED if n not in latest or latest[n]["conclusion"] != "success"]
+              if bad:
+                  return False, "required check runs missing or not success on the head: " + ", ".join(bad)
+              return True, f"tree {tree(head)} equals PR #{number} head {pr_head}"
+
+          try:
+              skip, reason = decide()
+          except Exception as error:
+              skip, reason = False, f"unreadable or unexpected forge answer: {error!r}"
+          print(f"skip={'true' if skip else 'false'}")
+          print(f"reason: {reason}")
+          PY
+            )"
+            printf '%s\n' "$out" | sed 's/^/merge_group_skip: /'
+            if printf '%s\n' "$out" | grep -qx 'skip=true'; then
+              skip=true
+            fi
+          fi
+          echo "skip=${skip}" >> "$GITHUB_OUTPUT"
+
   actionlint:
+    needs: [merge-group-guard]
+    if: ${{ !cancelled() && needs.merge-group-guard.outputs.skip != 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -24,14 +128,24 @@ jobs:
 
   ci-green:
     if: ${{ always() }}
-    needs: [actionlint]
+    needs: [merge-group-guard, actionlint]
     runs-on: ubuntu-latest
     steps:
       - name: Fail unless every needed job succeeded
         env:
           RESULTS: ${{ toJSON(needs.*.result) }}
+          SKIP: ${{ needs.merge-group-guard.outputs.skip }}
+          GUARD: ${{ needs.merge-group-guard.result }}
         run: |
           echo "needed results: $RESULTS"
+          if [ "$GUARD" != "success" ]; then
+            echo "ci-green: merge-group-guard did not succeed" >&2
+            exit 1
+          fi
+          # A skipped actionlint is green only when the guard proved tree equality.
+          if [ "$SKIP" = "true" ]; then
+            RESULTS="$(echo "$RESULTS" | sed 's/skipped/success/g')"
+          fi
           if echo "$RESULTS" | grep -Eq 'failure|cancelled|skipped'; then
             echo "ci-green: a needed job did not succeed" >&2
             exit 1
