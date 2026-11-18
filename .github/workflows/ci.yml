@@ -144,7 +144,7 @@ jobs:
           fi
           # A skipped actionlint is green only when the guard proved tree equality.
           if [ "$SKIP" = "true" ]; then
-            RESULTS="$(echo "$RESULTS" | sed 's/skipped/success/g')"
+            RESULTS="${RESULTS//skipped/success}"
           fi
           if echo "$RESULTS" | grep -Eq 'failure|cancelled|skipped'; then
             echo "ci-green: a needed job did not succeed" >&2
